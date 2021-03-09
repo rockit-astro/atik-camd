@@ -1,0 +1,670 @@
+#!/usr/bin/env python3.6
+#
+# This file is part of atik-camd.
+#
+# atik-camd is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# atik-camd is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with atik-camd.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Daemon for controlling an Atik camera via Pyro"""
+
+# pylint: disable=too-many-return-statements
+# pylint: disable=too-many-instance-attributes
+# pylint: disable=too-many-lines
+# pylint: disable=too-many-branches
+# pylint: disable=too-many-statements
+
+import argparse
+from ctypes import (c_float, c_int, c_short, c_ushort, c_void_p, byref, create_string_buffer, Structure, CDLL)
+import datetime
+import json
+import pathlib
+import queue
+import shutil
+import threading
+import time
+from astropy.io import fits
+from usb1.libusb1 import libusb_device_p, libusb_get_bus_number, libusb_get_device_address
+import numpy
+import Pyro4
+from warwick.observatory.common import (
+    log,
+    TryLock)
+from warwick.observatory.common.helpers import pyro_client_matches
+from warwick.swasp.atik import (
+    Config,
+    CommandStatus,
+    CameraStatus)
+
+# Set automatically when generating RPM package
+SOFTWARE_VERSION = "UNKNOWN"
+
+# If frames are being generated faster than the pipeline can handle
+# then we block the next frame until it is ready.
+# If it blocks for longer than this interval (in seconds) give up and cancel the sequence
+PIPELINE_HANDOVER_TIMEOUT = 10
+
+# Delay between camera state queries (in seconds)
+STATUS_QUERY_DELAY = 1
+
+log.error = lambda x, y: print('{}: {}'.format(x, y))
+log.info = lambda x, y: print('{}: {}'.format(x, y))
+
+
+class ARTEMISPROPERTIES(Structure):
+    _fields_ = [("Protocol", c_int),
+                ("nPixelsX", c_int),
+                ("nPixelsY", c_int),
+                ("PixelsMicronsX", c_float),
+                ("PixelsMicronsY", c_float),
+                ("ccdflags", c_int),
+                ("cameraflags", c_int),
+                ("Description", type(create_string_buffer(40))),
+                ("Manufacturer", type(create_string_buffer(40)))]
+
+
+def open_device(driver, usb_bus, usb_bus_devnum):
+    """Returns None if device is not found"""
+    # Enumerate cameras to find target
+    device_count = driver.ArtemisDeviceCount()
+    for i in range(device_count):
+        device = c_int(i)
+        if not driver.ArtemisDeviceIsPresent(device):
+            continue
+
+        if driver.ArtemisDeviceInUse(device):
+            continue
+
+        # The modified cameras report random serial numbers (different each query)
+        # so match off the physical USB port instead
+        device_libusb = libusb_device_p()
+        driver.ArtemisDeviceGetLibUSBDevice(device, byref(device_libusb))
+        device_bus = libusb_get_bus_number(device_libusb)
+        device_devnum = libusb_get_device_address(device_libusb)
+        print('{}: {}:{}'.format(i, device_bus, device_devnum))
+        if device_bus == usb_bus and device_devnum == usb_bus_devnum:
+            return driver.ArtemisConnect(device)
+
+    return None
+
+
+class CameraDaemon:
+    """Daemon interface for andor camera"""
+    def __init__(self, config):
+        self._config = config
+        self._status = CameraStatus.Disabled
+
+        self._handle = c_void_p()
+        self._driver = None
+        self._driver_lock = threading.Lock()
+
+        self._status_condition = threading.Condition()
+        self._command_lock = threading.Lock()
+
+        self._camera_model = 'unknown'
+
+        self._temperature = 0
+        self._temperature_locked = False
+        self._target_temperature = config.temperature_setpoint
+        self._cooler_power = 0
+        self._cooler_enabled = False
+
+        self._exposure_time = 1
+
+        # Limit and number of frames acquired during the next sequence
+        # Set to 0 to run continuously
+        self._sequence_frame_limit = 0
+
+        # Number of frames acquired this sequence
+        self._sequence_frame_count = 0
+
+        # Time that the latest frame in the exposure was started
+        self._sequence_exposure_start_time = datetime.datetime.utcnow()
+
+        # Information for building the output filename
+        self._output_directory = pathlib.Path(config.output_path)
+        self._output_frame_prefix = config.output_prefix
+
+        # Persistent frame counters
+        self._counter_filename = config.expcount_path
+        try:
+            with open(self._counter_filename, 'r') as infile:
+                data = json.load(infile)
+                self._exposure_count = data['exposure_count']
+                self._exposure_count_reference = data['exposure_reference']
+        except Exception:
+            now = datetime.datetime.utcnow().strftime('%Y-%m-%d')
+            self._exposure_count = 0
+            self._exposure_count_reference = now
+
+        # Thread that runs the exposure sequence
+        # Initialized by start() method
+        self._acquisition_thread = None
+
+        # Signal that the exposure sequence should be terminated
+        # at end of the current frame
+        self._stop_acquisition = False
+
+        self._log_acquisition_status = True
+
+        self._exposure_delay_condition = threading.Condition()
+        self._processing_queue = queue.Queue(maxsize=1)
+
+        # Thread for polling camera status
+        status_thread = threading.Thread(target=self.__poll_camera_status)
+        status_thread.daemon = True
+        status_thread.start()
+
+        # Thread for processing acquired frames
+        processing_thread = threading.Thread(target=self.__process_frames)
+        processing_thread.daemon = True
+        processing_thread.start()
+
+    def __poll_camera_status(self):
+        """Background thread that polls the camera status"""
+        ccd_temp = c_short()
+        cooler_flags = c_int()
+        cooler_level = c_int()
+        cooler_minlvl = c_int()
+        cooler_maxlvl = c_int()
+        cooler_setpoint = c_int()
+
+        while True:
+            # Query temperature
+            with self._driver_lock:
+                if self._driver is not None:
+                    # Query temperature status
+                    self._driver.ArtemisTemperatureSensorInfo(self._handle, 1, byref(ccd_temp))
+                    self._temperature = ccd_temp.value / 100.
+
+                    self._driver.ArtemisCoolingInfo(self._handle, byref(cooler_flags), byref(cooler_level),
+                                                    byref(cooler_minlvl), byref(cooler_maxlvl), byref(cooler_setpoint))
+
+                    self._cooler_enabled = (cooler_flags.value & 64) == 64
+                    self._cooler_power = round(cooler_level.value / 2.55)
+
+                    # Ignore camera-reported setpoint if cooling is disabled or warming up
+                    if not self._cooler_enabled or (cooler_flags.value & 32):
+                        self._target_temperature = None
+                        self._temperature_locked = False
+                    else:
+                        self._target_temperature = cooler_setpoint.value / 100.
+                        temp_delta = abs(self._temperature - self._target_temperature)
+                        self._temperature_locked = temp_delta < 0.5
+
+                else:
+                    self._status = CameraStatus.Disabled
+
+            time.sleep(STATUS_QUERY_DELAY)
+
+    def __set_target_temperature(self, target_temperature):
+        """
+        Set the camera temperature (if given a number) or warm up (if given None)
+        Returns True on success
+        """
+
+        with self._driver_lock:
+            if self._driver is None:
+                return False
+
+            if target_temperature is None:
+                status = self._driver.ArtemisCoolerWarmUp(self._handle)
+                if status != 0:
+                    print('failed to disable cooling with status {}'.format(status))
+                    return False
+            else:
+                status = self._driver.ArtemisSetCooling(self._handle, c_int(int(target_temperature * 100)))
+                if status != 0:
+                    print('failed to set temperature to {} with status {}'.format(target_temperature, status))
+                    return False
+
+            self._target_temperature = target_temperature
+
+            return status == 0
+
+    def __process_frames(self):
+        """Background thread that processes acquired frames"""
+        while True:
+            data, start_time, read_end_time = self._processing_queue.get()
+
+            # Build metadata list
+            obs_time = start_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]
+            time_src = 'NTP'
+            time_src_comment = 'DATE-OBS is a NTP-synced PC clock timestamp'
+            readout_height, readout_width = data.shape
+            window_x1 = 1
+            window_y1 = 1
+            window_x2 = readout_width + 1
+            window_y2 = readout_height + 1
+
+            header = [
+                (None, None, None),
+                ('COMMENT', ' ---                DATE/TIME                --- ', ''),
+                ('DATE-OBS', obs_time, '[UTC] exposure start time from TIME-SRC'),
+                ('TIME-SRC', time_src, time_src_comment),
+                ('EXPTIME', round(self._exposure_time, 3), '[s] exposure length'),
+                ('PC-RDEND', read_end_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3],
+                 '[UTC] local PC time when readout completed'),
+                (None, None, None),
+                ('COMMENT', ' ---           CAMERA INFORMATION            --- ', ''),
+                ('CAMSWVER', SOFTWARE_VERSION, 'camera server software version'),
+                ('INSTRARM', self._config.arm, 'camera identifier'),
+                ('CCD-TEMP', round(self._temperature, 2),
+                 '[deg c] CCD temperature at end of exposure'),
+                ('SET-TEMP', self._target_temperature, '[deg c] CCD temperature set point'),
+                ('TEMP-LCK', self._temperature_locked,
+                 'CCD temperature is locked to set point'),
+                ('CCD-XBIN', 1, '[px] x binning'),
+                ('CCD-YBIN', 1, '[px] y binning'),
+                ('CCD-WIND', '[{}:{},{}:{}]'.format(
+                    window_x1, window_x2,
+                    window_y1, window_y2),
+                 '[x1:x2,y1:y2] ccd window (detector coords)'),
+                ('IMAG-RGN', '[1:{},1:{}]'.format(readout_width, readout_height),
+                 '[x1:x2,y1:y2] image region (image coords)'),
+                ('EXPCNT', self._exposure_count, 'running exposure count since EXPCREF'),
+                ('EXPCREF', self._exposure_count_reference,
+                 'date the exposure counter was reset'),
+            ]
+
+            hdu = fits.PrimaryHDU(data)
+
+            # Using Card and append() to force comment cards to be placed inline
+            for h in header:
+                if h[0] is not None and h[1] is None:
+                    h = ('COMMENT', ' ' + h[0] + ' not available', '')
+                hdu.header.append(fits.Card(h[0], h[1], h[2]), end=True)
+
+            # Save errors shouldn't interfere with preview updates, so we use a separate
+            # try/catch
+            try:
+                filename = self._output_frame_prefix + \
+                           '-{:08d}.fits'.format(self._exposure_count)
+                path = str(self._output_directory / filename)
+
+                # Simulate an atomic write by writing to a temporary file then renaming
+                hdu.writeto(path + '.tmp', overwrite=True)
+                shutil.move(path + '.tmp', path)
+                print('Saving temporary frame: ' + filename)
+
+            except Exception as e:
+                self._stop_acquisition = True
+                print('Failed to save temporary frame: ' + str(e))
+                log.error(self._config.log_name, 'Failed to save temporary frame (' \
+                          + str(e) + ')')
+
+            # Hand frame over to the pipeline
+            # This may block if the pipeline is busy
+            try:
+                pass
+                # with self._config.pipeline_daemon.connect(PIPELINE_HANDOVER_TIMEOUT) as pipeline:
+                #    pipeline.notify_frame(self._config.arm_name, path)
+            except Exception as e:
+                self._stop_acquisition = True
+                print('Failed to hand frame to pipeline: ' + str(e))
+                log.error(self._config.log_name, 'Failed to hand frame to pipeline (' + str(e) + ')')
+
+    def __run_exposure_sequence(self):
+        """Worker thread that acquires frames and their times.
+           Tagged frames are pushed to the acquisition queue
+           for further processing on another thread"""
+        try:
+            while not self._stop_acquisition:
+                with self._driver_lock:
+                    start_time = datetime.datetime.utcnow()
+                    status = self._driver.ArtemisStartExposure(self._handle, c_float(self._exposure_time))
+                if status != 0:
+                    print('exposure sequence: failed to start acquisition with status ' + \
+                          str(status))
+                    log.error(self._config.log_name, 'Failed to start exposure sequence (' \
+                        + str(status) + ')')
+                    break
+
+                self._sequence_exposure_start_time = start_time
+
+                # Wait a short time for the camera to definitely start exposing
+                time.sleep(0.05)
+
+                while True:
+                    with self._driver_lock:
+                        if self._stop_acquisition:
+                            self._driver.ArtemisStopExposure(self._handle)
+                            break
+
+                        if self._driver.ArtemisImageReady(self._handle):
+                            break
+
+                    # Check every 100ms - this is fine for single-shot exposures
+                    with self._exposure_delay_condition:
+                        self._exposure_delay_condition.wait(0.1)
+
+                if self._stop_acquisition:
+                    break
+
+                if status != 0:
+                    print('exposure sequence: waiting failed with status ' + str(status))
+                    log.error(self._config.log_name, 'Failed to wait for acquisition (' \
+                        + str(status) + ')')
+                    break
+
+                x = c_int()
+                y = c_int()
+                w = c_int()
+                h = c_int()
+                binx = c_int()
+                biny = c_int()
+                self._driver.ArtemisGetImageData(self._handle,
+                                                 byref(x), byref(y), byref(w), byref(h),
+                                                 byref(binx), byref(biny))
+
+                self._driver.ArtemisImageBuffer.restype = c_void_p
+                imgpoint = (c_ushort * (h.value * w.value)).from_address(self._driver.ArtemisImageBuffer(self._handle))
+                data = numpy.ctypeslib.as_array(imgpoint).reshape((h.value, w.value))
+                read_end_time = datetime.datetime.utcnow()
+                self._processing_queue.put((data, start_time, read_end_time))
+
+                if self._stop_acquisition:
+                    break
+
+                if status != 0:
+                    if not self._stop_acquisition:
+                        print('exposure sequence: failed to get acquired data with status ' + \
+                            str(status))
+                        log.error(self._config.log_name, 'Failed to query frame data (' \
+                            + str(status) + ')')
+                    break
+
+                self._exposure_count += 1
+
+                # Save updated counts to disk
+                with open(self._counter_filename, 'w') as outfile:
+                    json.dump({
+                        'exposure_count': self._exposure_count,
+                        'exposure_reference': self._exposure_count_reference,
+                    }, outfile)
+
+                # Continue exposure sequence?
+                self._sequence_frame_count += 1
+                if 0 < self._sequence_frame_limit <= self._sequence_frame_count:
+                    self._stop_acquisition = True
+        finally:
+            print('exposure sequence: complete')
+            if self._log_acquisition_status:
+                log.info(self._config.log_name, 'Exposure sequence complete')
+            self._status = CameraStatus.Idle
+            self._stop_acquisition = False
+
+    @Pyro4.expose
+    def set_target_temperature(self, temperature, quiet=False):
+        """Set the target camera temperature"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            if self._status == CameraStatus.Disabled:
+                return CommandStatus.CameraNotInitialized
+
+            if temperature is not None and (temperature < -20 or temperature > 30):
+                return CommandStatus.TemperatureOutsideLimits
+
+            if not self.__set_target_temperature(temperature):
+                return CommandStatus.Failed
+
+            if not quiet:
+                log.info(self._config.log_name, 'Target temperature set to ' + str(temperature))
+            return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def report_status(self):
+        """Returns a dictionary containing the current camera state"""
+        data = {'state': self._status}
+        if self._status != CameraStatus.Disabled:
+            # Estimate the current frame progress based on the time delta
+            exposure_progress = 0
+            if self._status == CameraStatus.Acquiring:
+                if self._stop_acquisition:
+                    data['state'] = CameraStatus.Aborting
+                else:
+                    delta = datetime.datetime.utcnow() - self._sequence_exposure_start_time
+                    exposure_progress = delta.total_seconds()
+                    if exposure_progress > self._exposure_time:
+                        data['state'] = CameraStatus.Reading
+                        exposure_progress = 0
+
+            data.update({
+                'temperature': self._temperature,
+                'temperature_locked': self._temperature_locked,
+                'target_temperature': self._target_temperature,
+                'cooler_enabled': self._cooler_enabled,
+                'cooler_power': self._cooler_power,
+                'exposure_time': self._exposure_time,
+                'exposure_progress': exposure_progress,
+                'sequence_frame_limit': self._sequence_frame_limit,
+                'sequence_frame_count': self._sequence_frame_count,
+            })
+
+        return data
+
+    @Pyro4.expose
+    def initialize(self):
+        """Connects to the camera driver"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            if self._status != CameraStatus.Disabled:
+                return CommandStatus.CameraNotUninitialized
+
+            self._status = CameraStatus.Initializing
+            print('initializing driver')
+
+            driver = CDLL('libatikcameras.so')
+            try:
+                # Enumerate cameras to find target
+                handle = open_device(driver, self._config.usb_bus, self._config.usb_devnum)
+                if handle is None:
+                    print('camera {:03d}:{:03d} was not found'.format(self._config.usb_bus, self._config.usb_devnum))
+                    return CommandStatus.CameraNotFound
+
+                # Set default temperature
+                status = driver.ArtemisSetCooling(handle, c_int(int(self._target_temperature * 100)))
+                if status != 0:
+                    print('failed to set default target temperature with status {}'.format(status))
+                    return CommandStatus.Failed
+
+                with self._driver_lock:
+                    self._driver = driver
+                    self._handle = handle
+                    self._status = CameraStatus.Idle
+                    print('camera {:03d}:{:03d} initialized'.format(self._config.usb_bus, self._config.usb_devnum))
+
+                return CommandStatus.Succeeded
+            finally:
+                # Clean up on failure
+                if self._status != CameraStatus.Idle:
+                    if driver is not None and handle is not None:
+                        driver.ArtemisDisconnect(handle)
+
+                    self._status = CameraStatus.Disabled
+                    log.error(self._config.log_name, 'Failed to initialize camera')
+                else:
+                    log.info(self._config.log_name, 'Initialized camera')
+
+    @Pyro4.expose
+    def configure(self, params, quiet=False):
+        """Set camera configuration to the requested state
+           params should be a dictionary with the following keys:
+              temperature: Temperature set point
+              exposure: Exposure time in seconds
+           Any properties not specified in params will be reset to its default
+
+           The params dictionary should be validated using the
+           schema returned by the configure_validation_schema helper
+
+            Set quiet=True to disable log messages
+        """
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            if self._status == CameraStatus.Disabled:
+                return CommandStatus.CameraNotInitialized
+
+            if self._status != CameraStatus.Idle:
+                return CommandStatus.CameraNotIdle
+
+            # Reset cooling
+            temperature = params.get('temperature', self._config['temperature'])
+            if not self.__set_target_temperature(temperature):
+                return CommandStatus.Failed
+
+            if not quiet:
+                log.info(self._config.log_name, 'Target temperature set to ' + str(temperature))
+
+            # Reset exposure time
+            self._exposure_time = params.get('exposure', self._config['exposure'])
+
+            if not quiet:
+                log.info(self._config.log_name, 'Exposure time set to {:.3f}s'.format(self._exposure_time))
+
+            return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def set_exposure(self, seconds, quiet=False):
+        """Set the exposure time in seconds"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            if self._status == CameraStatus.Disabled:
+                return CommandStatus.CameraNotInitialized
+
+            if self._status != CameraStatus.Idle:
+                return CommandStatus.CameraNotIdle
+
+            self._exposure_time = seconds
+
+            if not quiet:
+                log.info(self._config.log_name, 'Exposure time set to {:.3f}s'.format(seconds))
+            return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def shutdown(self):
+        """Disconnects from the camera driver"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            if self._status == CameraStatus.Disabled:
+                return CommandStatus.CameraNotInitialized
+
+            # Complete the current exposure
+            if self._acquisition_thread is not None:
+                with self._driver_lock:
+                    self._driver.ArtemisStopExposure(self._handle)
+
+                print('shutdown: waiting for acquisition to complete')
+                self._stop_acquisition = True
+                self._acquisition_thread.join()
+
+            with self._driver_lock:
+                print('shutdown: disconnecting driver')
+                self._driver.ArtemisDisconnect(self._handle)
+                self._driver = None
+
+            log.info(self._config.log_name, 'Shutdown camera')
+            return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def start_sequence(self, count, quiet=False):
+        """Starts an exposure sequence with a set number of frames, or 0 to run until stopped"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            if self._status == CameraStatus.Disabled:
+                return CommandStatus.CameraNotInitialized
+
+            if self._status != CameraStatus.Idle:
+                return CommandStatus.CameraNotIdle
+
+            print('starting exposure sequence')
+            count_msg = 'until stopped'
+            if count == 1:
+                count_msg = '1 frame'
+            elif count > 1:
+                count_msg = str(count) + ' frames'
+
+            if not quiet:
+                log.info(self._config.log_name, 'Starting exposure sequence (' + count_msg + ')')
+
+            self._sequence_frame_limit = count
+            self._sequence_frame_count = 0
+            self._stop_acquisition = False
+            self._log_acquisition_status = not quiet
+            self._acquisition_thread = threading.Thread(target=self.__run_exposure_sequence)
+            self._acquisition_thread.daemon = False
+            self._acquisition_thread.start()
+            self._status = CameraStatus.Acquiring
+
+            return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def stop_sequence(self):
+        """Stops any active exposure sequence"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        if self._status == CameraStatus.Disabled:
+            return CommandStatus.CameraNotInitialized
+
+        # Note that the Waiting, Reading, Aborting, statuses are artificial
+        # self._status stays as CameraStatus.Acquiring during both of these
+        if self._status != CameraStatus.Acquiring or self._stop_acquisition:
+            return CommandStatus.CameraNotAcquiring
+
+        print('aborting exposure sequence')
+        log.info(self._config.log_name, 'Aborting exposure sequence')
+
+        self._sequence_frame_count = 0
+        self._stop_acquisition = True
+
+        with self._exposure_delay_condition:
+            self._exposure_delay_condition.notify_all()
+
+        return CommandStatus.Succeeded
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Camera control daemon')
+    parser.add_argument('config', help='Path to configuration json file')
+    args = parser.parse_args()
+    c = Config(args.config)
+    c.daemon.launch(CameraDaemon(c))
