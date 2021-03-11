@@ -78,13 +78,15 @@ def status(daemon, _):
         progress = '{:.1f} / {:.1f}s'.format(data['exposure_progress'], data['exposure_time'])
         state_desc += ' (' + FMT_BOLD + progress + FMT_CLEAR + ')'
 
+    if data['sequence_overlapped']:
+        state_desc += FMT_BOLD + ' OVERLAPPED' + FMT_CLEAR
+
     # Camera is disabled
     print('   Camera is {}'.format(state_desc))
     if data['state'] != CameraStatus.Disabled:
-
         if data['state'] > CameraStatus.Idle:
             if data['sequence_frame_limit'] > 0:
-                print('   Acquiring frame ' + FMT_BOLD + str(data['sequence_frame_count'] + 1) + \
+                print('   Acquiring frame ' + FMT_BOLD + str(data['sequence_frame_count'] + 1) +
                       ' / ' + str(data['sequence_frame_limit']) + FMT_CLEAR)
             else:
                 print('   Acquiring ' + FMT_BOLD + 'UNTIL STOPPED' + FMT_CLEAR)

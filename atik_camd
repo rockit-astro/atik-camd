@@ -25,7 +25,6 @@
 
 import argparse
 from ctypes import (c_float, c_int, c_short, c_ushort, c_void_p, byref, create_string_buffer, Structure, CDLL)
-import datetime
 import json
 import pathlib
 import queue
@@ -33,6 +32,8 @@ import shutil
 import threading
 import time
 from astropy.io import fits
+from astropy.time import Time, TimeDelta
+import astropy.units as u
 from usb1.libusb1 import libusb_device_p, libusb_get_bus_number, libusb_get_device_address
 import numpy
 import Pyro4
@@ -127,8 +128,10 @@ class CameraDaemon:
         # Number of frames acquired this sequence
         self._sequence_frame_count = 0
 
+        self._sequence_overlapped = False
+
         # Time that the latest frame in the exposure was started
-        self._sequence_exposure_start_time = datetime.datetime.utcnow()
+        self._sequence_exposure_start_time = Time.now()
 
         # Information for building the output filename
         self._output_directory = pathlib.Path(config.output_path)
@@ -142,7 +145,7 @@ class CameraDaemon:
                 self._exposure_count = data['exposure_count']
                 self._exposure_count_reference = data['exposure_reference']
         except Exception:
-            now = datetime.datetime.utcnow().strftime('%Y-%m-%d')
+            now = Time.now().strftime('%Y-%m-%d')
             self._exposure_count = 0
             self._exposure_count_reference = now
 
@@ -234,26 +237,27 @@ class CameraDaemon:
     def __process_frames(self):
         """Background thread that processes acquired frames"""
         while True:
-            data, start_time, read_end_time = self._processing_queue.get()
+            data, start_time, end_time, read_end_time = self._processing_queue.get()
 
             # Build metadata list
-            obs_time = start_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]
-            time_src = 'NTP'
-            time_src_comment = 'DATE-OBS is a NTP-synced PC clock timestamp'
+            obs_time = start_time.strftime('%Y-%m-%dT%H:%M:%S.%f')
+            exposure_time = (end_time - start_time).to(u.s).value
             readout_height, readout_width = data.shape
             window_x1 = 1
             window_y1 = 1
-            window_x2 = readout_width + 1
-            window_y2 = readout_height + 1
+            window_x2 = readout_width
+            window_y2 = readout_height
 
             header = [
                 (None, None, None),
                 ('COMMENT', ' ---                DATE/TIME                --- ', ''),
                 ('DATE-OBS', obs_time, '[UTC] exposure start time from TIME-SRC'),
-                ('TIME-SRC', time_src, time_src_comment),
-                ('EXPTIME', round(self._exposure_time, 3), '[s] exposure length'),
-                ('PC-RDEND', read_end_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3],
+                ('TIME-SRC', 'NTP', 'DATE-OBS is a NTP-synced PC clock timestamp'),
+                ('EXPTIME', round(exposure_time, 3), '[s] actual exposure length'),
+                ('EXPTARG', round(self._exposure_time, 3), '[s] requested exposure length'),
+                ('PC-RDEND', read_end_time.strftime('%Y-%m-%dT%H:%M:%S.%f'),
                  '[UTC] local PC time when readout completed'),
+                ('EXPOVRL', self._sequence_overlapped, 'ccd readout is overlapped with next exposure'),
                 (None, None, None),
                 ('COMMENT', ' ---           CAMERA INFORMATION            --- ', ''),
                 ('CAMSWVER', SOFTWARE_VERSION, 'camera server software version'),
@@ -284,8 +288,7 @@ class CameraDaemon:
                     h = ('COMMENT', ' ' + h[0] + ' not available', '')
                 hdu.header.append(fits.Card(h[0], h[1], h[2]), end=True)
 
-            # Save errors shouldn't interfere with preview updates, so we use a separate
-            # try/catch
+            # Save errors shouldn't interfere with preview updates, so we use a separate try/catch
             try:
                 filename = self._output_frame_prefix + \
                            '-{:08d}.fits'.format(self._exposure_count)
@@ -299,8 +302,7 @@ class CameraDaemon:
             except Exception as e:
                 self._stop_acquisition = True
                 print('Failed to save temporary frame: ' + str(e))
-                log.error(self._config.log_name, 'Failed to save temporary frame (' \
-                          + str(e) + ')')
+                log.error(self._config.log_name, 'Failed to save temporary frame (' + str(e) + ')')
 
             # Hand frame over to the pipeline
             # This may block if the pipeline is busy
@@ -318,44 +320,93 @@ class CameraDaemon:
            Tagged frames are pushed to the acquisition queue
            for further processing on another thread"""
         try:
-            while not self._stop_acquisition:
-                with self._driver_lock:
-                    start_time = datetime.datetime.utcnow()
-                    status = self._driver.ArtemisStartExposure(self._handle, c_float(self._exposure_time))
+            self._sequence_overlapped = self._sequence_frame_limit > 1 and self._exposure_time >= 6
+            self._sequence_frame_count = 0
+            with self._driver_lock:
+                self._driver.ArtemisSetAmplifierSwitched(self._handle, self._exposure_time > 0.0025)
+
+            if self._sequence_overlapped:
+                # Call ArtemisStartExposure with 0.098 to trigger an immediate(?) ccd readout
+                # This cleans the CCD and marks the start of our first exposure
+                # We are not interested in the data from this exposure, so can jump
+                # straight into the loop and wait for the end of exposure trigger
+                start_time = Time.now()
+                status = self._driver.ArtemisStartExposure(self._handle, c_float(0.098))
+                target_end_time = start_time + TimeDelta(self._exposure_time, format='sec')
                 if status != 0:
-                    print('exposure sequence: failed to start acquisition with status ' + \
-                          str(status))
-                    log.error(self._config.log_name, 'Failed to start exposure sequence (' \
-                        + str(status) + ')')
-                    break
+                    print('exposure sequence: waiting failed with status ' + str(status))
+                    log.error(self._config.log_name, 'Failed to wait for acquisition (' + str(status) + ')')
+                    return
 
                 self._sequence_exposure_start_time = start_time
 
-                # Wait a short time for the camera to definitely start exposing
+            while not self._stop_acquisition:
+                # When running in overlapped mode the actual exposure time is set based on the time
+                # between successive ArtemisStartExposure calls. We must therefore try and hit the requested
+                # time as precisely as possible. Start with a relatively coarse wait, which can be cancelled,
+                # until we're within 250ms of the target exposure time
+                if self._sequence_overlapped:
+                    while True:
+                        if target_end_time - Time.now() < 0.25 * u.s:
+                            break
+                        with self._exposure_delay_condition:
+                            self._exposure_delay_condition.wait(0.1)
+
+                    if self._stop_acquisition:
+                        return
+
+                with self._driver_lock:
+                    if self._sequence_overlapped:
+                        # We are now within 250ms of the target exposure time
+                        # Use finer loops to try and hit within 1ms
+                        for divisor in [1000, 10000]:
+                            while True:
+                                if target_end_time - Time.now() < 2.5 * u.s / divisor:
+                                    break
+                                time.sleep(1. / divisor)
+
+                        # Trigger a readout to complete the current exposure and start the next
+                        # Frame data will be available after the readout delay
+                        # start_time is set to end_time after the curent frame is saved
+                        end_time = Time.now()
+                        status = self._driver.ArtemisStartExposure(self._handle, c_float(0.098))
+                        target_end_time = end_time + TimeDelta(self._exposure_time, format='sec')
+                        self._sequence_exposure_start_time = end_time
+
+                        # Note: this will end up as self._sequence_frame_limit + 1 when reading out the final exposure.
+                        # report_status has special handling to correct this
+                        self._sequence_frame_count += 1
+                    else:
+                        # Normal (non-overlapped) exposure timing is controlled by the camera
+                        # Frame data will be available after the exposure time + readout delay
+                        start_time = Time.now()
+                        status = self._driver.ArtemisStartExposure(self._handle, c_float(self._exposure_time))
+                        end_time = start_time + TimeDelta(self._exposure_time, format='sec')
+                        self._sequence_exposure_start_time = start_time
+
+                if status != 0:
+                    print('exposure sequence: failed to start acquisition with status ' + str(status))
+                    log.error(self._config.log_name, 'Failed to start exposure sequence (' + str(status) + ')')
+                    return
+
+                # Wait a short time for the camera state to definitely change
                 time.sleep(0.05)
 
+                # Wait for the frame data to become available
+                # Check every 100ms and allow cancellation
                 while True:
                     with self._driver_lock:
                         if self._stop_acquisition:
                             self._driver.ArtemisStopExposure(self._handle)
-                            break
+                            return
 
                         if self._driver.ArtemisImageReady(self._handle):
                             break
 
-                    # Check every 100ms - this is fine for single-shot exposures
                     with self._exposure_delay_condition:
                         self._exposure_delay_condition.wait(0.1)
 
-                if self._stop_acquisition:
-                    break
-
-                if status != 0:
-                    print('exposure sequence: waiting failed with status ' + str(status))
-                    log.error(self._config.log_name, 'Failed to wait for acquisition (' \
-                        + str(status) + ')')
-                    break
-
+                # Pass image data to processing thread and continue with the next exposure
                 x = c_int()
                 y = c_int()
                 w = c_int()
@@ -366,23 +417,10 @@ class CameraDaemon:
                                                  byref(x), byref(y), byref(w), byref(h),
                                                  byref(binx), byref(biny))
 
-                self._driver.ArtemisImageBuffer.restype = c_void_p
                 imgpoint = (c_ushort * (h.value * w.value)).from_address(self._driver.ArtemisImageBuffer(self._handle))
                 data = numpy.ctypeslib.as_array(imgpoint).reshape((h.value, w.value))
-                read_end_time = datetime.datetime.utcnow()
-                self._processing_queue.put((data, start_time, read_end_time))
-
-                if self._stop_acquisition:
-                    break
-
-                if status != 0:
-                    if not self._stop_acquisition:
-                        print('exposure sequence: failed to get acquired data with status ' + \
-                            str(status))
-                        log.error(self._config.log_name, 'Failed to query frame data (' \
-                            + str(status) + ')')
-                    break
-
+                read_end_time = Time.now()
+                self._processing_queue.put((data, start_time, end_time, read_end_time))
                 self._exposure_count += 1
 
                 # Save updated counts to disk
@@ -392,16 +430,25 @@ class CameraDaemon:
                         'exposure_reference': self._exposure_count_reference,
                     }, outfile)
 
+                if self._sequence_overlapped:
+                    start_time = end_time
+                else:
+                    self._sequence_frame_count += 1
+
                 # Continue exposure sequence?
-                self._sequence_frame_count += 1
                 if 0 < self._sequence_frame_limit <= self._sequence_frame_count:
                     self._stop_acquisition = True
         finally:
+            if self._sequence_overlapped:
+                with self._driver_lock:
+                    self._driver.ArtemisStopExposure(self._handle)
+
             print('exposure sequence: complete')
             if self._log_acquisition_status:
                 log.info(self._config.log_name, 'Exposure sequence complete')
             self._status = CameraStatus.Idle
             self._stop_acquisition = False
+            self._sequence_overlapped = False
 
     @Pyro4.expose
     def set_target_temperature(self, temperature, quiet=False):
@@ -433,15 +480,18 @@ class CameraDaemon:
         if self._status != CameraStatus.Disabled:
             # Estimate the current frame progress based on the time delta
             exposure_progress = 0
+            sequence_frame_count = self._sequence_frame_count
             if self._status == CameraStatus.Acquiring:
                 if self._stop_acquisition:
                     data['state'] = CameraStatus.Aborting
                 else:
-                    delta = datetime.datetime.utcnow() - self._sequence_exposure_start_time
-                    exposure_progress = delta.total_seconds()
-                    if exposure_progress > self._exposure_time:
-                        data['state'] = CameraStatus.Reading
-                        exposure_progress = 0
+                    if self._sequence_exposure_start_time is not None:
+                        exposure_progress = (Time.now() - self._sequence_exposure_start_time).to(u.s).value
+                        if exposure_progress >= self._exposure_time:
+                            data['state'] = CameraStatus.Reading
+                        if self._sequence_overlapped and sequence_frame_count >= self._sequence_frame_limit:
+                            data['state'] = CameraStatus.Reading
+                            sequence_frame_count = self._sequence_frame_limit - 1
 
             data.update({
                 'temperature': self._temperature,
@@ -451,8 +501,9 @@ class CameraDaemon:
                 'cooler_power': self._cooler_power,
                 'exposure_time': self._exposure_time,
                 'exposure_progress': exposure_progress,
+                'sequence_overlapped': self._sequence_overlapped,
                 'sequence_frame_limit': self._sequence_frame_limit,
-                'sequence_frame_count': self._sequence_frame_count,
+                'sequence_frame_count': sequence_frame_count,
             })
 
         return data
@@ -474,6 +525,7 @@ class CameraDaemon:
             print('initializing driver')
 
             driver = CDLL('libatikcameras.so')
+            driver.ArtemisImageBuffer.restype = c_void_p
             try:
                 # Enumerate cameras to find target
                 handle = open_device(driver, self._config.usb_bus, self._config.usb_devnum)

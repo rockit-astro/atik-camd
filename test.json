@@ -4,7 +4,7 @@
   "log_name": "atik_camd@test",
   "control_machines": ["LocalHost"],
   "usb_bus": 1,
-  "usb_devnum": 5,
+  "usb_devnum": 3,
   "temperature_setpoint": -15,
   "arm": "TEST",
   "output_path": "/var/tmp/",
