@@ -24,7 +24,7 @@
 # pylint: disable=too-many-statements
 
 import argparse
-from ctypes import (c_float, c_int, c_short, c_ushort, c_void_p, byref, create_string_buffer, Structure, CDLL)
+from ctypes import c_float, c_int, c_short, c_ubyte, c_ushort, c_void_p, byref, create_string_buffer, Structure, CDLL
 import json
 import pathlib
 import queue
@@ -34,7 +34,7 @@ import time
 from astropy.io import fits
 from astropy.time import Time, TimeDelta
 import astropy.units as u
-from usb1.libusb1 import libusb_device_p, libusb_get_bus_number, libusb_get_device_address
+from usb1.libusb1 import libusb_device_p, libusb_get_bus_number, libusb_get_port_numbers
 import numpy
 import Pyro4
 from warwick.observatory.common import (
@@ -73,10 +73,15 @@ class ARTEMISPROPERTIES(Structure):
                 ("Manufacturer", type(create_string_buffer(40)))]
 
 
-def open_device(driver, usb_bus, usb_bus_devnum):
+def format_usb_path(bus, port_numbers):
+    return ':'.join(['{:03d}'.format(p) for p in [bus] + port_numbers])
+
+
+def open_device(driver, usb_path):
     """Returns None if device is not found"""
     # Enumerate cameras to find target
     device_count = driver.ArtemisDeviceCount()
+
     for i in range(device_count):
         device = c_int(i)
         if not driver.ArtemisDeviceIsPresent(device):
@@ -90,9 +95,14 @@ def open_device(driver, usb_bus, usb_bus_devnum):
         device_libusb = libusb_device_p()
         driver.ArtemisDeviceGetLibUSBDevice(device, byref(device_libusb))
         device_bus = libusb_get_bus_number(device_libusb)
-        device_devnum = libusb_get_device_address(device_libusb)
-        print('{}: {}:{}'.format(i, device_bus, device_devnum))
-        if device_bus == usb_bus and device_devnum == usb_bus_devnum:
+
+        # libusb documentation notes that USB 3.0 specifies a maximum depth of 7
+        device_port_numbers = (c_ubyte * 7)()
+        device_port_numbers_length = libusb_get_port_numbers(device_libusb, device_port_numbers, 7)
+        device_path = format_usb_path(device_bus, device_port_numbers[:device_port_numbers_length])
+
+        print('{}: {}'.format(i, device_path))
+        if usb_path == device_path:
             return driver.ArtemisConnect(device)
 
     return None
@@ -526,11 +536,14 @@ class CameraDaemon:
 
             driver = CDLL('libatikcameras.so')
             driver.ArtemisImageBuffer.restype = c_void_p
+            handle = None
             try:
                 # Enumerate cameras to find target
-                handle = open_device(driver, self._config.usb_bus, self._config.usb_devnum)
+                usb_path = format_usb_path(self._config.usb_bus, self._config.usb_port_numbers)
+                handle = open_device(driver, usb_path)
+
                 if handle is None:
-                    print('camera {:03d}:{:03d} was not found'.format(self._config.usb_bus, self._config.usb_devnum))
+                    print('camera {} was not found'.format(usb_path))
                     return CommandStatus.CameraNotFound
 
                 # Set default temperature
@@ -543,9 +556,11 @@ class CameraDaemon:
                     self._driver = driver
                     self._handle = handle
                     self._status = CameraStatus.Idle
-                    print('camera {:03d}:{:03d} initialized'.format(self._config.usb_bus, self._config.usb_devnum))
+                    print('camera {} initialized'.format(usb_path))
 
                 return CommandStatus.Succeeded
+            except Exception as e:
+                print(e)
             finally:
                 # Clean up on failure
                 if self._status != CameraStatus.Idle:

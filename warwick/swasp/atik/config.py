@@ -26,7 +26,7 @@ CONFIG_SCHEMA = {
     'type': 'object',
     'additionalProperties': False,
     'required': [
-        'daemon', 'pipeline_daemon', 'log_name', 'control_machines', 'usb_bus', 'usb_devnum',
+        'daemon', 'pipeline_daemon', 'log_name', 'control_machines', 'usb_bus', 'usb_port_numbers',
         'arm', 'temperature_setpoint', 'output_path', 'output_prefix', 'expcount_path'
     ],
     'properties': {
@@ -52,9 +52,14 @@ CONFIG_SCHEMA = {
             'type': 'number',
             'min': 1
         },
-        'usb_devnum': {
-            'type': 'number',
-            'min': 1
+        'usb_port_numbers': {
+            'type': 'array',
+            'items': {
+                'type': 'number',
+                'min': 1,
+                'minItems': 1,
+                'maxItems': 7
+            }
         },
         'temperature_setpoint': {
             'type': 'number',
@@ -153,7 +158,7 @@ class Config:
         self.log_name = config_json['log_name']
         self.control_ips = [getattr(IP, machine) for machine in config_json['control_machines']]
         self.usb_bus = config_json['usb_bus']
-        self.usb_devnum = config_json['usb_devnum']
+        self.usb_port_numbers = config_json['usb_port_numbers']
         self.arm = config_json['arm']
         self.output_path = config_json['output_path']
         self.output_prefix = config_json['output_prefix']

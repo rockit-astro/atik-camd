@@ -16,6 +16,7 @@
 
 """Validation schema used by opsd to verify observation schedule blocks"""
 
+
 def configure_validation_schema(camera):
     """Returns a jsonschema object for validating the
        params object passed to the configure method
