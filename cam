@@ -78,7 +78,7 @@ def status(daemon, _):
         progress = '{:.1f} / {:.1f}s'.format(data['exposure_progress'], data['exposure_time'])
         state_desc += ' (' + FMT_BOLD + progress + FMT_CLEAR + ')'
 
-    if data['sequence_overlapped']:
+    if 'sequence_overlapped' in data and data['sequence_overlapped']:
         state_desc += FMT_BOLD + ' OVERLAPPED' + FMT_CLEAR
 
     # Camera is disabled
