@@ -24,26 +24,15 @@ import os
 import sys
 import time
 import Pyro4
-from warwick.observatory.common import daemons
+from warwick.observatory.common import daemons, TFmt
 from warwick.swasp.atik import CommandStatus, CameraStatus
 
-# Set automatically when generating RPM package
-SOFTWARE_VERSION = 'UNKNOWN'
-
-CAMERAS = 'rasa'
 SCRIPT_NAME = os.path.basename(sys.argv[0])
 sys.excepthook = Pyro4.util.excepthook
 
 DAEMONS = {
     'test': daemons.localhost_test,
 }
-
-FMT_GREEN = u'\033[92m'
-FMT_RED = u'\033[91m'
-FMT_CYAN = u'\033[96m'
-FMT_YELLOW = u'\033[93m'
-FMT_BOLD = u'\033[1m'
-FMT_CLEAR = u'\033[0m'
 
 
 def run_command(daemon, command, args):
@@ -76,42 +65,42 @@ def status(daemon, _):
     state_desc = CameraStatus.label(data['state'])
     if data['state'] == CameraStatus.Acquiring:
         progress = '{:.1f} / {:.1f}s'.format(data['exposure_progress'], data['exposure_time'])
-        state_desc += ' (' + FMT_BOLD + progress + FMT_CLEAR + ')'
+        state_desc += ' (' + TFmt.Bold + progress + TFmt.Clear + ')'
 
     if 'sequence_overlapped' in data and data['sequence_overlapped']:
-        state_desc += FMT_BOLD + ' OVERLAPPED' + FMT_CLEAR
+        state_desc += TFmt.Bold + ' OVERLAPPED' + TFmt.Clear
 
     # Camera is disabled
     print('   Camera is {}'.format(state_desc))
     if data['state'] != CameraStatus.Disabled:
         if data['state'] > CameraStatus.Idle:
             if data['sequence_frame_limit'] > 0:
-                print('   Acquiring frame ' + FMT_BOLD + str(data['sequence_frame_count'] + 1) +
-                      ' / ' + str(data['sequence_frame_limit']) + FMT_CLEAR)
+                print('   Acquiring frame ' + TFmt.Bold + str(data['sequence_frame_count'] + 1) +
+                      ' / ' + str(data['sequence_frame_limit']) + TFmt.Clear)
             else:
-                print('   Acquiring ' + FMT_BOLD + 'UNTIL STOPPED' + FMT_CLEAR)
+                print('   Acquiring ' + TFmt.Bold + 'UNTIL STOPPED' + TFmt.Clear)
 
-        temperature_fmt = FMT_BOLD + FMT_RED
+        temperature_fmt = TFmt.Bold + TFmt.Red
         if data['temperature_locked']:
-            temperature_status = ' (' + FMT_BOLD + FMT_GREEN + 'LOCKED' + FMT_CLEAR + ')'
-            temperature_fmt = FMT_BOLD + FMT_GREEN
+            temperature_status = ' (' + TFmt.Bold + TFmt.Green + 'LOCKED' + TFmt.Clear + ')'
+            temperature_fmt = TFmt.Bold + TFmt.Green
         elif data['target_temperature'] is not None:
-            temperature_status = ' (' + FMT_BOLD + 'LOCKING ON {:.0f}\u00B0C'.format(
-                data['target_temperature']) + FMT_CLEAR + ')'
+            temperature_status = ' (' + TFmt.Bold + 'LOCKING ON {:.0f}\u00B0C'.format(
+                data['target_temperature']) + TFmt.Clear + ')'
         else:
             temperature_status = ''
 
         print('   Temperature is ' + temperature_fmt + '{:.0f}'.format(data['temperature']) + \
-              '\u00B0C' + FMT_CLEAR + temperature_status)
+              '\u00B0C' + TFmt.Clear + temperature_status)
 
-        cooler_fmt = FMT_BOLD
+        cooler_fmt = TFmt.Bold
         if data['cooler_enabled']:
             cooler_fmt += 'ENABLED ({}% power)'.format(data['cooler_power'])
         else:
-            cooler_fmt += FMT_RED + 'DISABLED'
+            cooler_fmt += TFmt.Red + 'DISABLED'
 
-        print('   Cooler is ' + cooler_fmt + FMT_CLEAR)
-        exposure_label = FMT_BOLD + '{:.3f} s'.format(data['exposure_time']) + FMT_CLEAR
+        print('   Cooler is ' + cooler_fmt + TFmt.Clear)
+        exposure_label = TFmt.Bold + '{:.3f} s'.format(data['exposure_time']) + TFmt.Clear
 
         print('   Exposure time is ' + exposure_label)
 
@@ -127,7 +116,7 @@ def set_temperature(daemon, args):
             temp = int(args[0])
         with daemon.connect() as camd:
             return camd.set_target_temperature(temp)
-    print('usage: {} [{}] temperature <degrees>'.format(SCRIPT_NAME, CAMERAS))
+    print('usage: {} [{}] temperature <degrees>'.format(SCRIPT_NAME, '|'.join(DAEMONS)))
     return -1
 
 
@@ -137,7 +126,7 @@ def set_exposure(daemon, args):
         exposure = float(args[0])
         with daemon.connect() as camd:
             return camd.set_exposure(exposure)
-    print('usage: {} [{}] exposure <seconds>'.format(SCRIPT_NAME, CAMERAS))
+    print('usage: {} [{}] exposure <seconds>'.format(SCRIPT_NAME, '|'.join(DAEMONS)))
     return -1
 
 
@@ -147,7 +136,7 @@ def set_exposure_delay(daemon, args):
         delay = float(args[0])
         with daemon.connect() as camd:
             return camd.set_exposure_delay(delay)
-    print('usage: {} [{}] delay <seconds>'.format(SCRIPT_NAME, CAMERAS))
+    print('usage: {} [{}] delay <seconds>'.format(SCRIPT_NAME, '|'.join(DAEMONS)))
     return -1
 
 
@@ -157,7 +146,7 @@ def set_shutter(daemon, args):
         enabled = args[0] == 'auto'
         with daemon.connect() as camd:
             return camd.set_shutter(enabled)
-    print('usage: {} [{}] shutter [auto|dark]'.format(SCRIPT_NAME, CAMERAS))
+    print('usage: {} [{}] shutter [auto|dark]'.format(SCRIPT_NAME, '|'.join(DAEMONS)))
     return -1
 
 
@@ -176,7 +165,7 @@ def set_window(daemon, args):
         with daemon.connect() as camd:
             return camd.set_window(window)
 
-    print('usage: {} [{}] window (<x1> <x2> <y1> <y2>|default)'.format(SCRIPT_NAME, CAMERAS))
+    print('usage: {} [{}] window (<x1> <x2> <y1> <y2>|default)'.format(SCRIPT_NAME, '|'.join(DAEMONS)))
     return -1
 
 
@@ -191,7 +180,7 @@ def start(daemon, args):
         except Exception:
             print('error: invalid exposure count:', args[0])
             return -1
-    print('usage: {} [{}] start (continuous|<count>)'.format(SCRIPT_NAME, CAMERAS))
+    print('usage: {} [{}] start (continuous|<count>)'.format(SCRIPT_NAME, '|'.join(DAEMONS)))
     return -1
 
 
@@ -223,7 +212,7 @@ def reboot(daemon, _):
 
 def print_usage():
     """Prints the utility help"""
-    print('usage: {} [{}] <command> [<args>]'.format(SCRIPT_NAME, CAMERAS))
+    print('usage: {} [{}] <command> [<args>]'.format(SCRIPT_NAME, '|'.join(DAEMONS)))
     print()
     print('general commands:')
     print('   status       print a human-readable summary of the camera status')
