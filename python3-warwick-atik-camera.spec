@@ -1,5 +1,5 @@
 Name:           python3-warwick-atik-camera
-Version:        1.0.0
+Version:        20210501
 Release:        0
 License:        GPL3
 Summary:        Common backend code for the Atik camera daemon

@@ -271,7 +271,7 @@ class CameraDaemon:
                 (None, None, None),
                 ('COMMENT', ' ---           CAMERA INFORMATION            --- ', ''),
                 ('CAMSWVER', SOFTWARE_VERSION, 'camera server software version'),
-                ('INSTRARM', self._config.arm, 'camera identifier'),
+                ('CAMID', self._config.camera_id, 'camera identifier'),
                 ('CCD-TEMP', round(self._temperature, 2),
                  '[deg c] CCD temperature at end of exposure'),
                 ('SET-TEMP', self._target_temperature, '[deg c] CCD temperature set point'),
@@ -318,8 +318,8 @@ class CameraDaemon:
             # This may block if the pipeline is busy
             try:
                 pass
-                # with self._config.pipeline_daemon.connect(PIPELINE_HANDOVER_TIMEOUT) as pipeline:
-                #    pipeline.notify_frame(self._config.arm_name, path)
+                with self._config.pipeline_daemon.connect(PIPELINE_HANDOVER_TIMEOUT) as pipeline:
+                    pipeline.notify_frame(self._config.camera_id, path)
             except Exception as e:
                 self._stop_acquisition = True
                 print('Failed to hand frame to pipeline: ' + str(e))

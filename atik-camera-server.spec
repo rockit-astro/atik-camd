@@ -1,5 +1,5 @@
 Name:      atik-camera-server
-Version:   1.0.0
+Version:   20210501
 Release:   0
 Url:       https://github.com/warwick-one-metre/atik-camd
 Summary:   Camera control server for the SuperWASP telescope.

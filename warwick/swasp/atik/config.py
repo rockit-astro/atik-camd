@@ -27,7 +27,7 @@ CONFIG_SCHEMA = {
     'additionalProperties': False,
     'required': [
         'daemon', 'pipeline_daemon', 'log_name', 'control_machines', 'usb_bus', 'usb_port_numbers',
-        'arm', 'temperature_setpoint', 'output_path', 'output_prefix', 'expcount_path'
+        'camera_id', 'temperature_setpoint', 'output_path', 'output_prefix', 'expcount_path'
     ],
     'properties': {
         'daemon': {
@@ -66,7 +66,7 @@ CONFIG_SCHEMA = {
             'min': -20,
             'max': 30,
         },
-        'arm': {
+        'camera_id': {
             'type': 'string',
         },
         'output_path': {
@@ -159,7 +159,7 @@ class Config:
         self.control_ips = [getattr(IP, machine) for machine in config_json['control_machines']]
         self.usb_bus = config_json['usb_bus']
         self.usb_port_numbers = config_json['usb_port_numbers']
-        self.arm = config_json['arm']
+        self.camera_id = config_json['camera_id']
         self.output_path = config_json['output_path']
         self.output_prefix = config_json['output_prefix']
         self.expcount_path = config_json['expcount_path']

@@ -1,12 +1,12 @@
 {
   "daemon": "localhost_test",
-  "pipeline_daemon": "localhost_test",
+  "pipeline_daemon": "localhost_test2",
   "log_name": "atik_camd@test",
   "control_machines": ["LocalHost"],
   "usb_bus": 1,
   "usb_port_numbers": [2],
   "temperature_setpoint": -15,
-  "arm": "TEST",
+  "camera_id": "TEST",
   "output_path": "/var/tmp/",
   "output_prefix": "test",
   "expcount_path": "/var/tmp/test-counter.json"
