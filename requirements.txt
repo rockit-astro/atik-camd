@@ -1,0 +1,5 @@
+astropy==4.1
+numpy==1.19.5
+libusb1==1.9.2
+Pyro4==4.80
+jsonschema==2.6.0

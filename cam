@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.6
+#!/usr/bin/env python3
 #
 # This file is part of atik-camd.
 #
@@ -20,28 +20,25 @@
 # pylint: disable=invalid-name
 # pylint: disable=broad-except
 
+import glob
 import os
 import sys
-import time
 import Pyro4
-from warwick.observatory.common import daemons, TFmt
-from warwick.swasp.atik import CommandStatus, CameraStatus
+from warwick.observatory.common import TFmt
+from warwick.observatory.camera.atik import CommandStatus, CameraStatus, Config
 
 SCRIPT_NAME = os.path.basename(sys.argv[0])
 sys.excepthook = Pyro4.util.excepthook
 
-DAEMONS = {
-    'test': daemons.localhost_test,
-}
 
-
-def run_command(daemon, command, args):
+def run_command(config_paths, camera_id, command, args):
     """Prints the message associated with a status code and returns the code"""
+    config = Config(config_paths[camera_id])
     try:
-        ret = command(daemon, args)
+        ret = command(config, sorted(config_paths.keys()), args)
     except KeyboardInterrupt:
         # ctrl-c terminates the running command
-        ret = stop(daemon, args)
+        ret = stop(config, args)
 
         # Report successful stop
         if ret == 0:
@@ -49,17 +46,16 @@ def run_command(daemon, command, args):
     except Pyro4.errors.CommunicationError:
         ret = -101
 
-    # Print message associated with error codes, except for -1 (error handled locally)
-    if ret != -1 and ret != 0:
+    # Print message associated with error codes
+    if ret not in [-1, 0]:
         print(CommandStatus.message(ret))
-    elif ret != -1 and ret != 0:
-        print('Returned unknown status code: {0}'.format(ret))
+
     return ret
 
 
-def status(daemon, _):
+def status(config, *_):
     """Reports the current camera status"""
-    with daemon.connect() as camd:
+    with config.daemon.connect() as camd:
         data = camd.report_status()
 
     state_desc = CameraStatus.label(data['state'])
@@ -107,150 +103,112 @@ def status(daemon, _):
     return 0
 
 
-def set_temperature(daemon, args):
+def set_temperature(config, camera_ids, args):
     """Set the camera temperature"""
     if len(args) == 1:
         if args[0] == 'warm':
             temp = None
         else:
             temp = int(args[0])
-        with daemon.connect() as camd:
+        with config.daemon.connect() as camd:
             return camd.set_target_temperature(temp)
-    print('usage: {} [{}] temperature <degrees>'.format(SCRIPT_NAME, '|'.join(DAEMONS)))
+    print('usage: {} [{}] temperature <degrees>'.format(SCRIPT_NAME, '|'.join(camera_ids)))
     return -1
 
 
-def set_exposure(daemon, args):
+def set_exposure(config, camera_ids, args):
     """Set the camera exposure time"""
     if len(args) == 1:
         exposure = float(args[0])
-        with daemon.connect() as camd:
+        with config.daemon.connect() as camd:
             return camd.set_exposure(exposure)
-    print('usage: {} [{}] exposure <seconds>'.format(SCRIPT_NAME, '|'.join(DAEMONS)))
+    print('usage: {} [{}] exposure <seconds>'.format(SCRIPT_NAME, '|'.join(camera_ids)))
     return -1
 
 
-def set_exposure_delay(daemon, args):
-    """Set the camera pre-exposure delay"""
-    if len(args) == 1:
-        delay = float(args[0])
-        with daemon.connect() as camd:
-            return camd.set_exposure_delay(delay)
-    print('usage: {} [{}] delay <seconds>'.format(SCRIPT_NAME, '|'.join(DAEMONS)))
-    return -1
-
-
-def set_shutter(daemon, args):
-    """Set the camera shutter mode"""
-    if len(args) == 1 and (args[0] == 'auto' or args[0] == 'dark'):
-        enabled = args[0] == 'auto'
-        with daemon.connect() as camd:
-            return camd.set_shutter(enabled)
-    print('usage: {} [{}] shutter [auto|dark]'.format(SCRIPT_NAME, '|'.join(DAEMONS)))
-    return -1
-
-
-def set_window(daemon, args):
-    """Set the camera readout window"""
-    window = None
-    if len(args) == 4:
-        window = [
-            int(args[0]),
-            int(args[1]),
-            int(args[2]),
-            int(args[3])
-        ]
-
-    if window or (len(args) == 1 and args[0] == 'default'):
-        with daemon.connect() as camd:
-            return camd.set_window(window)
-
-    print('usage: {} [{}] window (<x1> <x2> <y1> <y2>|default)'.format(SCRIPT_NAME, '|'.join(DAEMONS)))
-    return -1
-
-
-def start(daemon, args):
+def start(config, camera_ids, args):
     """Starts an exposure sequence"""
     if len(args) == 1:
         try:
             count = 0 if args[0] == 'continuous' else int(args[0])
             if args[0] == 'continuous' or count > 0:
-                with daemon.connect() as camd:
+                with config.daemon.connect() as camd:
                     return camd.start_sequence(count)
         except Exception:
             print('error: invalid exposure count:', args[0])
             return -1
-    print('usage: {} [{}] start (continuous|<count>)'.format(SCRIPT_NAME, '|'.join(DAEMONS)))
+    print('usage: {} [{}] start (continuous|<count>)'.format(SCRIPT_NAME, '|'.join(camera_ids)))
     return -1
 
 
-def stop(daemon, _):
+def stop(config, *_):
     """Stops any active camera exposures"""
-    with daemon.connect() as camd:
+    with config.daemon.connect() as camd:
         return camd.stop_sequence()
 
 
-def initialize(daemon, _):
+def initialize(config, *_):
     """Enables the camera driver"""
     # Initialization can take more than 5 sec, so bump timeout to 10.
-    with daemon.connect(10) as camd:
+    with config.daemon.connect(10) as camd:
         return camd.initialize()
 
 
-def shutdown(daemon, _):
+def shutdown(config, *_):
     """Disables the camera drivers"""
-    with daemon.connect() as camd:
+    with config.daemon.connect() as camd:
         return camd.shutdown()
 
 
-def reboot(daemon, _):
-    """Reboots the camera driver"""
-    shutdown(daemon, _)
-    time.sleep(5)
-    return initialize(daemon, _)
-
-
-def print_usage():
+def print_usage(config_paths):
     """Prints the utility help"""
-    print('usage: {} [{}] <command> [<args>]'.format(SCRIPT_NAME, '|'.join(DAEMONS)))
+    print('usage: {} [{}] <command> [<args>]'.format(SCRIPT_NAME, '|'.join(sorted(config_paths.keys()))))
     print()
     print('general commands:')
     print('   status       print a human-readable summary of the camera status')
     print('   exposure     set exposure time in seconds')
-    print('   delay        set pre-exposure delay in seconds')
-    print('   shutter      set shutter mode')
-    print('   window       set readout geometry')
     print('   start        start an exposure sequence')
     print()
     print('engineering commands:')
     print('   init         initialize the camera driver')
     print('   temperature  set target temperature and enable cooling')
     print('   kill         disconnect from camera driver')
-    print('   reboot       kill and reinitialize the camera driver')
     print()
 
     return 0
 
 
 if __name__ == '__main__':
+    if 'CAMD_CONFIG_ROOT' in os.environ:
+        config_root = os.environ['CAMD_CONFIG_ROOT']
+    else:
+        config_root = '/etc/camd'
+
+    configs = {os.path.basename(p)[:-5]: p for p in glob.glob(os.path.join(config_root, '*.json'))}
+    if not configs:
+        print('error: no camera configs were found in ' + config_root)
+        print('       run as CAMD_CONFIG_ROOT=/path/to/config/root ' + ' '.join(sys.argv))
+        print('       to specify the configuration root directory')
+        sys.exit(1)
+
+    if len(sys.argv) == 2 and sys.argv[1] == 'list-cameras':
+        print(' '.join(sorted(configs.keys())))
+        sys.exit(0)
+
     if len(sys.argv) < 3:
-        sys.exit(print_usage())
+        sys.exit(print_usage(configs))
 
     commands = {
         'temperature': set_temperature,
         'exposure': set_exposure,
-        'delay': set_exposure_delay,
-        'shutter': set_shutter,
-        'window': set_window,
         'status': status,
         'start': start,
         'stop': stop,
         'init': initialize,
-        'kill': shutdown,
-        'reboot': reboot
+        'kill': shutdown
     }
 
-    if sys.argv[1] not in DAEMONS or sys.argv[2] not in commands:
-        sys.exit(print_usage())
+    if sys.argv[1] not in configs or sys.argv[2] not in commands:
+        sys.exit(print_usage(configs))
 
-    sys.exit(run_command(DAEMONS[sys.argv[1]], commands[sys.argv[2]], sys.argv[3:]))
+    sys.exit(run_command(configs, sys.argv[1], commands[sys.argv[2]], sys.argv[3:]))

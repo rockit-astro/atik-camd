@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.6
+#!/usr/bin/env python3
 #
 # This file is part of atik-camd.
 #
@@ -37,28 +37,12 @@ import astropy.units as u
 from usb1.libusb1 import libusb_device_p, libusb_get_bus_number, libusb_get_port_numbers
 import numpy
 import Pyro4
-from warwick.observatory.common import (
-    log,
-    TryLock)
+from warwick.observatory.common import log, TryLock
 from warwick.observatory.common.helpers import pyro_client_matches
-from warwick.swasp.atik import (
-    Config,
-    CommandStatus,
-    CameraStatus)
+from warwick.observatory.camera.atik import CommandStatus, CameraStatus, Config
 
 # Set automatically when generating RPM package
 SOFTWARE_VERSION = "UNKNOWN"
-
-# If frames are being generated faster than the pipeline can handle
-# then we block the next frame until it is ready.
-# If it blocks for longer than this interval (in seconds) give up and cancel the sequence
-PIPELINE_HANDOVER_TIMEOUT = 10
-
-# Delay between camera state queries (in seconds)
-STATUS_QUERY_DELAY = 1
-
-log.error = lambda x, y: print('{}: {}'.format(x, y))
-log.info = lambda x, y: print('{}: {}'.format(x, y))
 
 
 class ARTEMISPROPERTIES(Structure):
@@ -217,7 +201,7 @@ class CameraDaemon:
                 else:
                     self._status = CameraStatus.Disabled
 
-            time.sleep(STATUS_QUERY_DELAY)
+            time.sleep(self._config.temperature_query_delay)
 
     def __set_target_temperature(self, target_temperature):
         """
@@ -317,8 +301,7 @@ class CameraDaemon:
             # Hand frame over to the pipeline
             # This may block if the pipeline is busy
             try:
-                pass
-                with self._config.pipeline_daemon.connect(PIPELINE_HANDOVER_TIMEOUT) as pipeline:
+                with self._config.pipeline_daemon.connect(self._config.pipeline_handover_timeout) as pipeline:
                     pipeline.notify_frame(self._config.camera_id, path)
             except Exception as e:
                 self._stop_acquisition = True
