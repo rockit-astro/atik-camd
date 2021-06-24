@@ -1,0 +1,15 @@
+{
+  "daemon": "superwasp_cam1",
+  "pipeline_daemon": "superwasp_pipeline",
+  "pipeline_handover_timeout": 10,
+  "log_name": "atik_camd@cam1",
+  "control_machines": ["SWASPCameraPi", "SWASPTCS"],
+  "usb_bus": 1,
+  "usb_port_numbers": [1, 1],
+  "temperature_setpoint": -15,
+  "temperature_query_delay": 1,
+  "camera_id": "CAM1",
+  "output_path": "/mnt/wasp-data/",
+  "output_prefix": "cam1",
+  "expcount_path": "/var/tmp/cam1-counter.json"
+}
