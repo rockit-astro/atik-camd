@@ -313,7 +313,7 @@ class CameraDaemon:
            Tagged frames are pushed to the acquisition queue
            for further processing on another thread"""
         try:
-            self._sequence_overlapped = self._sequence_frame_limit > 1 and self._exposure_time >= 6
+            self._sequence_overlapped = self._sequence_frame_limit != 1 and self._exposure_time >= 6
             self._sequence_frame_count = 0
             with self._driver_lock:
                 self._driver.ArtemisSetAmplifierSwitched(self._handle, self._exposure_time > 0.0025)
