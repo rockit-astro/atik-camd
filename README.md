@@ -24,7 +24,7 @@ The configuration options are:
   "temperature_setpoint": -15, # Default temperature for the CMOS sensor.
   "temperature_query_delay": 1, # Amount of time in seconds to wait between querying the camera temperature and cooling status
   "camera_id": "TEST", # Value to use for the CAMERA fits header keyword.
-  "output_path": "/var/tmp/", # Path to save temporary output frames before they are handed to the pipeline daemon.
+  "output_path": "/var/tmp/", # Path to save temporary output frames before they are handed to the pipeline daemon. This should match the pipeline incoming_data_path setting.
   "output_prefix": "test", # Filename prefix to use for temporary output frames.
   "expcount_path": "/var/tmp/test-counter.json" # Path to the json file that is used to track the continuous frame number.
 }

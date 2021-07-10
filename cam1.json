@@ -9,7 +9,7 @@
   "temperature_setpoint": -15,
   "temperature_query_delay": 1,
   "camera_id": "CAM1",
-  "output_path": "/mnt/wasp-data/",
+  "output_path": "/mnt/wasp-data/incoming",
   "output_prefix": "cam1",
   "expcount_path": "/var/tmp/cam1-counter.json"
 }
