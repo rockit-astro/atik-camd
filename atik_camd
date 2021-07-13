@@ -530,10 +530,11 @@ class CameraDaemon:
                     return CommandStatus.CameraNotFound
 
                 # Set default temperature
-                status = driver.ArtemisSetCooling(handle, c_int(int(self._target_temperature * 100)))
-                if status != 0:
-                    print('failed to set default target temperature with status {}'.format(status))
-                    return CommandStatus.Failed
+                if self._target_temperature:
+                    status = driver.ArtemisSetCooling(handle, c_int(int(self._target_temperature * 100)))
+                    if status != 0:
+                        print('failed to set default target temperature with status {}'.format(status))
+                        return CommandStatus.Failed
 
                 with self._driver_lock:
                     self._driver = driver
@@ -544,6 +545,7 @@ class CameraDaemon:
                 return CommandStatus.Succeeded
             except Exception as e:
                 print(e)
+                return CommandStatus.Failed
             finally:
                 # Clean up on failure
                 if self._status != CameraStatus.Idle:
