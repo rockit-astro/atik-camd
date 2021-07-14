@@ -31,9 +31,9 @@ import queue
 import shutil
 import threading
 import time
-from astropy.io import fits
 from astropy.time import Time, TimeDelta
 import astropy.units as u
+from fitsio import FITS
 from usb1.libusb1 import libusb_device_p, libusb_get_bus_number, libusb_get_port_numbers
 import numpy
 import Pyro4
@@ -276,23 +276,24 @@ class CameraDaemon:
                  'date the exposure counter was reset'),
             ]
 
-            hdu = fits.PrimaryHDU(data)
-
-            # Using Card and append() to force comment cards to be placed inline
-            for h in header:
-                if h[0] is not None and h[1] is None:
-                    h = ('COMMENT', ' ' + h[0] + ' not available', '')
-                hdu.header.append(fits.Card(h[0], h[1], h[2]), end=True)
-
             # Save errors shouldn't interfere with preview updates, so we use a separate try/catch
             try:
                 filename = self._output_frame_prefix + \
                            '-{:08d}.fits'.format(self._exposure_count)
                 path = str(self._output_directory / filename)
 
-                # Simulate an atomic write by writing to a temporary file then renaming
                 foo = Time.now()
-                hdu.writeto(path + '.tmp', overwrite=True)
+
+                # Simulate an atomic write by writing to a temporary file then renaming
+                with FITS(path + '.tmp', 'rw') as fits:
+                    fits.write(data)
+                    for h in header:
+                        if h[0] is not None and h[1] is None:
+                            fits[0].write_comment(h[0] + ' not available')
+                        elif h[0] is not None:
+                            # TODO: Write empty lines back in
+                            fits[0].write_key(h[0], h[1], h[2])
+
                 shutil.move(path + '.tmp', path)
                 print('Saving temporary frame: {} {} {}'.format(filename, exposure_time, (Time.now() - foo).to(u.s)))
 
