@@ -144,8 +144,6 @@ def process_frames(queue, camera_id, output_directory, output_frame_prefix):
                        '-{:08d}.fits'.format(exposure_count)
             path = str(output_directory / filename)
 
-            foo = Time.now()
-
             # Simulate an atomic write by writing to a temporary file then renaming
             with FITS(path + '.tmp', 'rw') as fits:
                 fits.write(data)
@@ -157,7 +155,7 @@ def process_frames(queue, camera_id, output_directory, output_frame_prefix):
                         fits[0].write_key(h[0], h[1], h[2])
 
             shutil.move(path + '.tmp', path)
-            print('Saving temporary frame: {} {} {}'.format(filename, exposure_time, (Time.now() - foo).to(u.s)))
+            print('Saving temporary frame: ' + filename)
 
         except Exception as e:
             print('Failed to save temporary frame: ' + str(e))
@@ -260,7 +258,6 @@ class CameraDaemon:
         while True:
             # Query temperature
             with self._driver_lock:
-                foo = Time.now()
                 if self._driver is not None:
                     # Query temperature status
                     self._driver.ArtemisTemperatureSensorInfo(self._handle, 1, byref(ccd_temp))
@@ -284,7 +281,6 @@ class CameraDaemon:
                 else:
                     self._status = CameraStatus.Disabled
 
-            print((Time.now() - foo).to(u.s))
             time.sleep(self._config.temperature_query_delay)
 
     def __set_target_temperature(self, target_temperature):
