@@ -25,7 +25,7 @@ CONFIG_SCHEMA = {
     'required': [
         'daemon', 'pipeline_daemon', 'pipeline_handover_timeout', 'log_name', 'control_machines', 'usb_bus',
         'usb_port_numbers', 'camera_id', 'temperature_setpoint', 'temperature_query_delay',
-        'output_path', 'output_prefix', 'expcount_path'
+        'output_path', 'expcount_path'
     ],
     'properties': {
         'daemon': {
@@ -78,9 +78,6 @@ CONFIG_SCHEMA = {
         'output_path': {
             'type': 'string',
         },
-        'output_prefix': {
-            'type': 'string',
-        },
         'expcount_path': {
             'type': 'string',
         }
@@ -103,7 +100,7 @@ class Config:
         })
 
         self.daemon = getattr(daemons, config_json['daemon'])
-        self.pipeline_daemon = getattr(daemons, config_json['pipeline_daemon'])
+        self.pipeline_daemon_name = config_json['pipeline_daemon']
         self.pipeline_handover_timeout = config_json['pipeline_handover_timeout']
         self.log_name = config_json['log_name']
         self.control_ips = [getattr(IP, machine) for machine in config_json['control_machines']]
@@ -111,7 +108,6 @@ class Config:
         self.usb_port_numbers = config_json['usb_port_numbers']
         self.camera_id = config_json['camera_id']
         self.output_path = config_json['output_path']
-        self.output_prefix = config_json['output_prefix']
         self.expcount_path = config_json['expcount_path']
         self.temperature_setpoint = config_json['temperature_setpoint']
         self.temperature_query_delay = config_json['temperature_query_delay']
