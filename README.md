@@ -68,11 +68,17 @@ sudo python3 setup.py install
 Start the systemd services:
 ```
 sudo systemctl daemon-reload
-sudo systemctl enable qhy_camd.service@<config>
-sudo systemctl start qhy_camd@<config>
+sudo systemctl enable atik_camd@<config>
+sudo systemctl start atik_camd@<config>
 ```
 
 where `config` is the name of the json file for each camera.
+
+Finally, we need to set up NFS to mount the pipeline incoming data directory. Edit `/etc/fstab` and add
+
+```
+10.2.6.217:/data/wasp /mnt/wasp-data   nfs defaults,x-systemd.automount,x-systemd.after=network-online.target,_netdev 0 0
+```
 
 ### Testing Locally
 
