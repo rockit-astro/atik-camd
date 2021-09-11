@@ -3,7 +3,7 @@
   "pipeline_daemon": "superwasp_pipeline",
   "pipeline_handover_timeout": 10,
   "log_name": "atik_camd@2",
-  "control_machines": ["SWASPCameraPi", "SWASPTCS"],
+  "control_machines": ["SWASPCameraPi1", "SWASPCameraPi2", "SWASPTCS"],
   "usb_bus": 1,
   "usb_port_numbers": [1, 2],
   "temperature_setpoint": -15,
