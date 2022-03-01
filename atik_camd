@@ -268,7 +268,7 @@ class CameraDaemon:
                     else:
                         self._target_temperature = cooler_setpoint.value / 100.
                         temp_delta = abs(self._temperature - self._target_temperature)
-                        self._temperature_locked = temp_delta < 0.5
+                        self._temperature_locked = temp_delta < 1.5
 
                 else:
                     self._status = CameraStatus.Disabled
