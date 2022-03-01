@@ -379,13 +379,10 @@ class CameraDaemon:
                 time.sleep(0.05)
 
                 # Wait for the frame data to become available
-                # Check every 100ms and allow cancellation
+                # Note that we don't support early cancellation because this
+                # can put the camera into a corrupted state that requires a full power cycle
                 while True:
                     with self._driver_lock:
-                        if self._stop_acquisition or self._processing_stop_signal.value:
-                            self._driver.ArtemisStopExposure(self._handle)
-                            return
-
                         if self._driver.ArtemisImageReady(self._handle):
                             break
 
@@ -406,22 +403,25 @@ class CameraDaemon:
                 imgpoint = (c_ushort * (h.value * w.value)).from_address(self._driver.ArtemisImageBuffer(self._handle))
                 data = numpy.ctypeslib.as_array(imgpoint).reshape((h.value, w.value))
                 read_end_time = Time.now()
-                self._processing_queue.put({
-                    'data': data,
-                    'start_time': start_time.strftime('%Y-%m-%dT%H:%M:%S.%f'),
-                    'end_time': end_time.strftime('%Y-%m-%dT%H:%M:%S.%f'),
-                    'read_end_time': read_end_time.strftime('%Y-%m-%dT%H:%M:%S.%f'),
-                    'exposure': (end_time - start_time).to(u.s).value,
-                    'target_exposure': self._exposure_time,
-                    'sequence_overlapped': self._sequence_overlapped,
-                    'temperature': self._temperature,
-                    'target_temperature': self._target_temperature,
-                    'temperature_locked': self._temperature_locked,
-                    'cooler_power': self._cooler_power,
-                    'cooler_enabled': self._cooler_enabled,
-                    'exposure_count': self._exposure_count,
-                    'exposure_count_reference': self._exposure_count_reference
-                })
+
+                # Discard the image if the sequence has been cancelled
+                if not self._stop_acquisition and not self._processing_stop_signal.value:
+                    self._processing_queue.put({
+                        'data': data,
+                        'start_time': start_time.strftime('%Y-%m-%dT%H:%M:%S.%f'),
+                        'end_time': end_time.strftime('%Y-%m-%dT%H:%M:%S.%f'),
+                        'read_end_time': read_end_time.strftime('%Y-%m-%dT%H:%M:%S.%f'),
+                        'exposure': (end_time - start_time).to(u.s).value,
+                        'target_exposure': self._exposure_time,
+                        'sequence_overlapped': self._sequence_overlapped,
+                        'temperature': self._temperature,
+                        'target_temperature': self._target_temperature,
+                        'temperature_locked': self._temperature_locked,
+                        'cooler_power': self._cooler_power,
+                        'cooler_enabled': self._cooler_enabled,
+                        'exposure_count': self._exposure_count,
+                        'exposure_count_reference': self._exposure_count_reference
+                    })
 
                 self._exposure_count += 1
 
